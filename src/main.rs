@@ -1,5 +1,6 @@
 use libc::{c_int, c_uint, c_void};
 
+use std::fmt::Debug;
 use std::os::unix::prelude::*;
 use std::sync::atomic::{self, Ordering};
 
@@ -24,7 +25,7 @@ unsafe fn io_uring_enter(
         min_complete,
         flags,
         std::ptr::null::<c_void>(), // arg
-        0 as libc::size_t, // argsz
+        0 as libc::size_t,          // argsz
     ) as c_int
 }
 
@@ -173,32 +174,38 @@ impl IoUring {
     fn queue(&mut self) -> (RawSubmissionQueue, RawCompletionQueue) {
         let sq_ptr = self.sq_raw as *mut u8;
         let cq_ptr = self.cq_raw as *mut u8;
-        let sqes = self.sqe_raw as *mut io_uring::io_uring_sqe;
+        let sqes = unsafe {
+            std::slice::from_raw_parts_mut(self.sqe_raw as *mut _, self.params.sq_entries as usize)
+        };
 
         let sq = unsafe {
             RawSubmissionQueue {
-                _holder: Default::default(),
                 fd: self.fd,
-                head: sq_ptr.add(self.params.sq_off.head as usize) as *const _,
-                tail: sq_ptr.add(self.params.sq_off.tail as usize) as *const _,
-                mask: sq_ptr.add(self.params.sq_off.ring_mask as usize) as *const _,
-                flags: sq_ptr.add(self.params.sq_off.flags as usize) as *const _,
-                dropped_count: sq_ptr.add(self.params.sq_off.dropped as usize) as *const _,
-                indices: sq_ptr.add(self.params.sq_off.array as usize) as *mut _,
+                head: &*(sq_ptr.add(self.params.sq_off.head as usize) as *const _),
+                tail: &*(sq_ptr.add(self.params.sq_off.tail as usize) as *const _),
+                mask: &*(sq_ptr.add(self.params.sq_off.ring_mask as usize) as *const _),
+                flags: &*(sq_ptr.add(self.params.sq_off.flags as usize) as *const _),
+                dropped_count: &*(sq_ptr.add(self.params.sq_off.dropped as usize) as *const _),
+                indices: std::slice::from_raw_parts_mut(
+                    sq_ptr.add(self.params.sq_off.array as usize) as *mut _,
+                    self.params.sq_entries as usize,
+                ),
                 sqes,
             }
         };
 
         let cq = unsafe {
             RawCompletionQueue {
-                _holder: Default::default(),
                 fd: self.fd,
-                head: cq_ptr.add(self.params.cq_off.head as usize) as *const _,
-                tail: cq_ptr.add(self.params.cq_off.tail as usize) as *const _,
-                mask: cq_ptr.add(self.params.cq_off.ring_mask as usize) as *const _,
-                flags: cq_ptr.add(self.params.cq_off.flags as usize) as *const _,
-                overflow_count: cq_ptr.add(self.params.cq_off.overflow as usize) as *const _,
-                cqes: cq_ptr.add(self.params.cq_off.cqes as usize) as *mut _,
+                head: &*(cq_ptr.add(self.params.cq_off.head as usize) as *const _),
+                tail: &*(cq_ptr.add(self.params.cq_off.tail as usize) as *const _),
+                mask: &*(cq_ptr.add(self.params.cq_off.ring_mask as usize) as *const _),
+                flags: &*(cq_ptr.add(self.params.cq_off.flags as usize) as *const _),
+                overflow_count: &*(cq_ptr.add(self.params.cq_off.overflow as usize) as *const _),
+                cqes: std::slice::from_raw_parts_mut(
+                    cq_ptr.add(self.params.cq_off.cqes as usize) as *mut _,
+                    self.params.cq_entries as usize,
+                ),
             }
         };
 
@@ -236,31 +243,44 @@ impl Drop for IoUring {
     }
 }
 
-#[derive(Debug)]
 pub struct RawSubmissionQueue<'q> {
-    _holder: std::marker::PhantomData<&'q ()>,
     fd: RawFd,
-    head: *const atomic::AtomicU32,
-    tail: *const atomic::AtomicU32,
-    mask: *const u32,
-    flags: *const atomic::AtomicU32,
-    dropped_count: *const atomic::AtomicU32,
-    indices: *mut u32,
-    sqes: *mut io_uring::io_uring_sqe,
+    head: &'q atomic::AtomicU32,
+    tail: &'q atomic::AtomicU32,
+    mask: &'q u32,
+    flags: &'q atomic::AtomicU32,
+    dropped_count: &'q atomic::AtomicU32,
+    indices: &'q mut [u32],
+    sqes: &'q mut [io_uring::io_uring_sqe],
+}
+
+impl Debug for RawSubmissionQueue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawSubmissionQueue")
+            .field("fd", &self.fd)
+            .field(
+                "sqes",
+                &format_args!(
+                    "({}/{} {})",
+                    self.len(),
+                    self.entry_count(),
+                    if self.len() == 1 { "entry" } else { "entries" }
+                ),
+            )
+            .finish()
+    }
 }
 
 impl RawSubmissionQueue<'_> {
     fn entry_count(&self) -> u32 {
-        unsafe { *self.mask + 1 }
+        self.sqes.len() as u32
     }
 
     /// 큐에 남아 있는 SQE의 개수를 가져옵니다.
     pub fn len(&self) -> u32 {
-        unsafe {
-            let head = (*self.head).load(Ordering::Acquire);
-            let tail = (*self.tail).load(Ordering::Relaxed);
-            tail - head
-        }
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        tail - head
     }
 
     /// 큐에 비어 있는 자리의 개수를 가져옵니다.
@@ -273,8 +293,8 @@ impl RawSubmissionQueue<'_> {
     /// # Safety
     /// `sqe`는 해당하는 CQE가 돌아올 때까지 올바른 값을 갖고 있어야 합니다.
     pub unsafe fn enqueue(&mut self, sqe: io_uring::io_uring_sqe) -> Result<(), Error> {
-        let head = (*self.head).load(Ordering::Acquire);
-        let tail = (*self.tail).load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
         let mask = *self.mask;
         let index = tail & mask;
         // 링 버퍼가 가득 찼는지 확인한다.
@@ -283,9 +303,9 @@ impl RawSubmissionQueue<'_> {
         }
 
         // 버퍼 끝에 SQE를 넣는다.
-        self.sqes.add(index as usize).write(sqe);
-        self.indices.add(index as usize).write(index);
-        (*self.tail).store(tail + 1, Ordering::Release);
+        self.sqes[index as usize] = sqe;
+        self.indices[index as usize] = index;
+        self.tail.store(tail + 1, Ordering::Release);
 
         Ok(())
     }
@@ -313,30 +333,43 @@ impl RawSubmissionQueue<'_> {
     }
 }
 
-#[derive(Debug)]
 pub struct RawCompletionQueue<'q> {
-    _holder: std::marker::PhantomData<&'q ()>,
     fd: RawFd,
-    head: *const atomic::AtomicU32,
-    tail: *const atomic::AtomicU32,
-    mask: *const u32,
-    overflow_count: *const atomic::AtomicU32,
-    flags: *const atomic::AtomicU32,
-    cqes: *mut io_uring::io_uring_cqe,
+    head: &'q atomic::AtomicU32,
+    tail: &'q atomic::AtomicU32,
+    mask: &'q u32,
+    overflow_count: &'q atomic::AtomicU32,
+    flags: &'q atomic::AtomicU32,
+    cqes: &'q mut [io_uring::io_uring_cqe],
+}
+
+impl Debug for RawCompletionQueue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawCompletionQueue")
+            .field("fd", &self.fd)
+            .field(
+                "cqes",
+                &format_args!(
+                    "({}/{} {})",
+                    self.len(),
+                    self.entry_count(),
+                    if self.len() == 1 { "entry" } else { "entries" }
+                ),
+            )
+            .finish()
+    }
 }
 
 impl RawCompletionQueue<'_> {
     fn entry_count(&self) -> u32 {
-        unsafe { *self.mask + 1 }
+        self.cqes.len() as u32
     }
 
     /// 큐에 남아 있는 CQE의 개수를 가져옵니다.
     pub fn len(&self) -> u32 {
-        unsafe {
-            let head = (*self.head).load(Ordering::Acquire);
-            let tail = (*self.tail).load(Ordering::Relaxed);
-            tail - head
-        }
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        tail - head
     }
 
     /// 큐에 남아 있는 SQE의 개수를 가져옵니다.
@@ -346,23 +379,21 @@ impl RawCompletionQueue<'_> {
 
     /// 큐에서 CQE 하나를 꺼냅니다.
     pub fn dequeue(&mut self) -> Option<io_uring::io_uring_cqe> {
-        unsafe {
-            let head = (*self.head).load(Ordering::Acquire);
-            let tail = (*self.tail).load(Ordering::Relaxed);
-            // 링 버퍼가 비어 있는지 확인한다.
-            if head == tail {
-                return None;
-            }
-
-            let mask = *self.mask;
-            let index = head & mask;
-
-            // 링 버퍼 앞에서 CQE 하나를 꺼낸다.
-            let cqe = self.cqes.add(index as usize).read();
-            (*self.head).store(head + 1, Ordering::Release);
-
-            Some(cqe)
+        let head = self.head.load(Ordering::Acquire);
+        let tail = self.tail.load(Ordering::Relaxed);
+        // 링 버퍼가 비어 있는지 확인한다.
+        if head == tail {
+            return None;
         }
+
+        let mask = *self.mask;
+        let index = head & mask;
+
+        // 링 버퍼 앞에서 CQE 하나를 꺼낸다.
+        let cqe = self.cqes[index as usize];
+        self.head.store(head + 1, Ordering::Release);
+
+        Some(cqe)
     }
 }
 
