@@ -272,7 +272,7 @@ impl RawSubmissionQueue<'_> {
     ///
     /// # Safety
     /// `sqe`는 해당하는 CQE가 돌아올 때까지 올바른 값을 갖고 있어야 합니다.
-    pub unsafe fn enqueue(&self, sqe: io_uring::io_uring_sqe) -> Result<(), Error> {
+    pub unsafe fn enqueue(&mut self, sqe: io_uring::io_uring_sqe) -> Result<(), Error> {
         let head = (*self.head).load(Ordering::Acquire);
         let tail = (*self.tail).load(Ordering::Relaxed);
         let mask = *self.mask;
@@ -345,7 +345,7 @@ impl RawCompletionQueue<'_> {
     }
 
     /// 큐에서 CQE 하나를 꺼냅니다.
-    pub fn dequeue(&self) -> Option<io_uring::io_uring_cqe> {
+    pub fn dequeue(&mut self) -> Option<io_uring::io_uring_cqe> {
         unsafe {
             let head = (*self.head).load(Ordering::Acquire);
             let tail = (*self.tail).load(Ordering::Relaxed);
@@ -368,7 +368,7 @@ impl RawCompletionQueue<'_> {
 
 fn main() {
     let mut uring = IoUring::new(2).expect("Failed to request ring buffer");
-    let (sq, cq) = uring.queue();
+    let (mut sq, mut cq) = uring.queue();
 
     let file = std::fs::File::open("test").unwrap();
 
