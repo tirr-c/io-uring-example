@@ -367,8 +367,8 @@ impl RawCompletionQueue<'_> {
 
     /// 큐에 남아 있는 CQE의 개수를 가져옵니다.
     pub fn len(&self) -> u32 {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         tail - head
     }
 
@@ -379,8 +379,8 @@ impl RawCompletionQueue<'_> {
 
     /// 큐에서 CQE 하나를 꺼냅니다.
     pub fn dequeue(&mut self) -> Option<io_uring::io_uring_cqe> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         // 링 버퍼가 비어 있는지 확인한다.
         if head == tail {
             return None;
