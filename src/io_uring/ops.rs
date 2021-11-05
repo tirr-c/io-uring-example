@@ -1,10 +1,6 @@
 use std::os::unix::prelude::*;
 
-use super::sys::{
-    self,
-    io_uring_cqe as RawCqe,
-    io_uring_sqe as RawSqe,
-};
+use super::sys::{self, io_uring_cqe as RawCqe, io_uring_sqe as RawSqe};
 
 pub unsafe trait SubmissionOp: Sized {
     type Context: Send + 'static;
@@ -26,19 +22,21 @@ pub struct CompletionReceiver<Op> {
 
 impl<Op: SubmissionOp> CompletionReceiver<Op> {
     pub fn recv(self) -> Op::Result {
-        let cqe = self.channel.recv()
-            .expect("channel disconnected");
+        let cqe = self.channel.recv().expect("channel disconnected");
         unsafe { Op::from_cqe(cqe) }
     }
 
     pub fn try_recv(self) -> Result<Op::Result, Self> {
-        self.channel.try_recv()
+        self.channel
+            .try_recv()
             .map_err(|_| self)
             .map(|cqe| unsafe { Op::from_cqe(cqe) })
     }
 }
 
-fn completion_channel<Op: SubmissionOp>(ctx: Op::Context) -> (CompletionSender, CompletionReceiver<Op>) {
+fn completion_channel<Op: SubmissionOp>(
+    ctx: Op::Context,
+) -> (CompletionSender, CompletionReceiver<Op>) {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let sender = CompletionSender {
         channel: tx,
@@ -98,9 +96,13 @@ unsafe impl<Fd: AsRawFd + Send + 'static> SubmissionOp for VectoredRead<Fd> {
         let sender = Box::from_raw(sender);
         let ctx = Box::<dyn std::any::Any + Send>::downcast::<Self::Context>(sender.ctx)
             .expect("wrong context");
-        let iovec = ctx.iovec_sys.iter()
+        let iovec = ctx
+            .iovec_sys
+            .iter()
             .zip(ctx.iovec_caps.iter())
-            .map(|(iov, &cap)| Vec::from_raw_parts(iov.iov_base as *mut u8, iov.iov_len as usize, cap))
+            .map(|(iov, &cap)| {
+                Vec::from_raw_parts(iov.iov_base as *mut u8, iov.iov_len as usize, cap)
+            })
             .collect::<Vec<_>>();
         let res = cqe.res;
         let result = if res < 0 {
@@ -120,7 +122,10 @@ unsafe impl<Fd: AsRawFd + Send + 'static> SubmissionOp for VectoredRead<Fd> {
             .iovec
             .into_iter()
             .map(|mut v| {
-                let iovec = libc::iovec { iov_base: v.as_mut_ptr() as *mut _, iov_len: v.len() };
+                let iovec = libc::iovec {
+                    iov_base: v.as_mut_ptr() as *mut _,
+                    iov_len: v.len(),
+                };
                 let cap = v.capacity();
                 std::mem::forget(v);
                 (iovec, cap)
@@ -146,9 +151,7 @@ unsafe impl<Fd: AsRawFd + Send + 'static> SubmissionOp for VectoredRead<Fd> {
             flags: 0,
             ioprio: 0,
             fd: rawfd,
-            __bindgen_anon_1: sys::io_uring_sqe__bindgen_ty_1 {
-                off: self.offset,
-            },
+            __bindgen_anon_1: sys::io_uring_sqe__bindgen_ty_1 { off: self.offset },
             __bindgen_anon_2: sys::io_uring_sqe__bindgen_ty_2 {
                 addr: iovec_sys_ptr as usize as u64,
             },

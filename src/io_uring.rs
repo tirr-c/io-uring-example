@@ -1,13 +1,12 @@
 use std::cell::UnsafeCell;
 use std::fmt::Debug;
 use std::os::unix::prelude::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 
 use libc::{c_int, c_uint, c_void};
 use nix::{
-    errno,
-    fcntl,
+    errno, fcntl,
     sys::{eventfd, mman},
     unistd,
 };
@@ -17,15 +16,8 @@ pub use sys::io_uring_cqe as RawCqe;
 pub use sys::io_uring_sqe as RawSqe;
 
 mod ops;
-use ops::{
-    SubmissionOp,
-    CompletionSender,
-};
-pub use ops::{
-    CompletionReceiver,
-    VectoredRead,
-    VectoredReadResult,
-};
+pub use ops::{CompletionReceiver, VectoredRead, VectoredReadResult};
+use ops::{CompletionSender, SubmissionOp};
 
 /// `io_uring_setup` 시스템 콜 래퍼입니다.
 unsafe fn io_uring_setup(entries: u32, p: *mut sys::io_uring_params) -> c_int {
@@ -56,13 +48,7 @@ unsafe fn io_uring_register(
     arg: *mut c_void,
     nr_args: c_uint,
 ) -> c_int {
-    libc::syscall(
-        libc::SYS_io_uring_register,
-        fd,
-        opcode,
-        arg,
-        nr_args,
-    ) as c_int
+    libc::syscall(libc::SYS_io_uring_register, fd, opcode, arg, nr_args) as c_int
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -119,7 +105,12 @@ struct IoUringMeta {
 impl Drop for IoUringMeta {
     fn drop(&mut self) {
         unsafe {
-            io_uring_register(self.fd as u32, sys::IORING_UNREGISTER_EVENTFD, std::ptr::null_mut(), 0);
+            io_uring_register(
+                self.fd as u32,
+                sys::IORING_UNREGISTER_EVENTFD,
+                std::ptr::null_mut(),
+                0,
+            );
         }
         unistd::close(self.fd).ok();
         unistd::close(self.eventfd).ok();
@@ -130,10 +121,15 @@ impl IoUringMeta {
     fn new(fd: RawFd, params: sys::io_uring_params) -> Self {
         let is_single_mmap = params.features & sys::IORING_FEAT_SINGLE_MMAP != 0;
 
-        let mut eventfd = eventfd::eventfd(0, eventfd::EfdFlags::empty())
-            .expect("eventfd creation failed");
+        let mut eventfd =
+            eventfd::eventfd(0, eventfd::EfdFlags::empty()).expect("eventfd creation failed");
         unsafe {
-            io_uring_register(fd as u32, sys::IORING_REGISTER_EVENTFD, &mut eventfd as *mut _ as *mut c_void, 1);
+            io_uring_register(
+                fd as u32,
+                sys::IORING_REGISTER_EVENTFD,
+                &mut eventfd as *mut _ as *mut c_void,
+                1,
+            );
         }
 
         Self {
@@ -214,7 +210,9 @@ impl Drop for IoUringSqInner {
             let mask = *self.mask_ref();
             let last_head = head.load(Ordering::Acquire);
             let last_tail = tail.swap(last_head, Ordering::Release);
-            self.meta.pending.fetch_sub(last_tail - last_head, Ordering::AcqRel);
+            self.meta
+                .pending
+                .fetch_sub(last_tail - last_head, Ordering::AcqRel);
 
             let array = self.array_ref();
             let sqe_raw = self.sqe_raw as *mut RawSqe;
@@ -266,13 +264,16 @@ impl IoUringSqInner {
 
     fn mask_ref(&self) -> &u32 {
         unsafe {
-            &*(self.sq_bytes_ptr().offset(self.meta.params.sq_off.ring_mask as isize) as *const u32)
+            &*(self
+                .sq_bytes_ptr()
+                .offset(self.meta.params.sq_off.ring_mask as isize) as *const u32)
         }
     }
 
     fn array_ref(&self) -> *mut u32 {
         unsafe {
-            self.sq_bytes_ptr().offset(self.meta.params.sq_off.array as isize) as *mut u32
+            self.sq_bytes_ptr()
+                .offset(self.meta.params.sq_off.array as isize) as *mut u32
         }
     }
 
@@ -285,7 +286,9 @@ impl IoUringSqInner {
 
         let array_idx = index & mask;
         (*sqe_ptr.offset(array_idx as isize)).get().write(sqe);
-        (*array_ptr.offset(array_idx as isize)).get().write(array_idx);
+        (*array_ptr.offset(array_idx as isize))
+            .get()
+            .write(array_idx);
     }
 }
 
@@ -308,7 +311,12 @@ impl IoUringSqInner {
                 return Err(Error::SubmissionQueueFull);
             }
 
-            let result = updating_tail.compare_exchange(index, index.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire);
+            let result = updating_tail.compare_exchange(
+                index,
+                index.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
             if result.is_err() {
                 // 다른 스레드가 먼저 갱신했으므로 기다림
                 backoff.spin();
@@ -321,7 +329,15 @@ impl IoUringSqInner {
         self.meta.pending.fetch_add(1, Ordering::Relaxed);
         self.write_to_idx(index, entry);
 
-        while tail.compare_exchange(index, index.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire).is_err() {
+        while tail
+            .compare_exchange(
+                index,
+                index.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
             // 이전 스레드가 작업을 마칠 때까지 대기
             backoff.snooze();
         }
@@ -486,7 +502,9 @@ impl IoUringCqInner {
 
     fn mask_ref(&self) -> &u32 {
         unsafe {
-            &*(self.cq_bytes_ptr().offset(self.meta.params.cq_off.ring_mask as isize) as *const u32)
+            &*(self
+                .cq_bytes_ptr()
+                .offset(self.meta.params.cq_off.ring_mask as isize) as *const u32)
         }
     }
 
@@ -494,7 +512,9 @@ impl IoUringCqInner {
     /// Unsynchronized access
     unsafe fn read_from_idx(&self, index: u32) -> RawCqe {
         let mask = *self.mask_ref();
-        let cqe_ptr = self.cq_bytes_ptr().offset(self.meta.params.cq_off.cqes as isize) as *const RawCqe;
+        let cqe_ptr = self
+            .cq_bytes_ptr()
+            .offset(self.meta.params.cq_off.cqes as isize) as *const RawCqe;
 
         let cqe_idx = index & mask;
         cqe_ptr.offset(cqe_idx as isize).read()
@@ -535,8 +555,7 @@ impl IoUring {
     pub fn new(entries: u32) -> Result<Self, Error> {
         let meta = unsafe {
             // 커널에 링 버퍼를 부탁한다. 커널은 버퍼를 만든 뒤 관련 파라미터를 돌려준다.
-            let mut params =
-                std::mem::MaybeUninit::<sys::io_uring_params>::zeroed().assume_init();
+            let mut params = std::mem::MaybeUninit::<sys::io_uring_params>::zeroed().assume_init();
             let fd = io_uring_setup(entries, &mut params);
             if fd == -1 {
                 let errno = errno::errno();
@@ -575,7 +594,8 @@ impl IoUring {
                 Err(errno) => return Err(Error::MapFailed(errno as i32)),
             }
         };
-        sq.updating_tail.store(sq.tail_ref().load(Ordering::Acquire), Ordering::Release);
+        sq.updating_tail
+            .store(sq.tail_ref().load(Ordering::Acquire), Ordering::Release);
 
         let mut cq = IoUringCqInner {
             meta: meta.clone(),
