@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
+crossbeam-channel = "0.5.1"
+crossbeam-utils = "0.8.5"
 libc = "0.2.102"
 
 [build-dependencies]

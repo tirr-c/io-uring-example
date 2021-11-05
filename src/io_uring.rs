@@ -1,12 +1,25 @@
-use libc::{c_int, c_uint, c_void};
-
+use std::cell::UnsafeCell;
 use std::fmt::Debug;
 use std::os::unix::prelude::*;
-use std::sync::atomic::{self, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+
+use libc::{c_int, c_uint, c_void};
 
 pub mod sys;
 pub use sys::io_uring_cqe as RawCqe;
 pub use sys::io_uring_sqe as RawSqe;
+
+mod ops;
+use ops::{
+    SubmissionOp,
+    CompletionSender,
+};
+pub use ops::{
+    CompletionReceiver,
+    VectoredRead,
+    VectoredReadResult,
+};
 
 /// `io_uring_setup` 시스템 콜 래퍼입니다.
 unsafe fn io_uring_setup(entries: u32, p: *mut sys::io_uring_params) -> c_int {
@@ -28,6 +41,21 @@ unsafe fn io_uring_enter(
         flags,
         std::ptr::null::<c_void>(), // arg
         0 as libc::size_t,          // argsz
+    ) as c_int
+}
+
+unsafe fn io_uring_register(
+    fd: c_uint,
+    opcode: c_uint,
+    arg: *mut c_void,
+    nr_args: c_uint,
+) -> c_int {
+    libc::syscall(
+        libc::SYS_io_uring_register,
+        fd,
+        opcode,
+        arg,
+        nr_args,
     ) as c_int
 }
 
@@ -67,12 +95,429 @@ impl MemoryMapSize {
 
 #[derive(Debug)]
 pub struct IoUring {
+    meta: Arc<IoUringMeta>,
+    sq: IoUringSq,
+    cq: IoUringCq,
+}
+
+#[derive(Debug)]
+struct IoUringMeta {
     fd: RawFd,
     params: sys::io_uring_params,
-    sq_raw: *mut c_void,
-    cq_raw: *mut c_void,
-    sqe_raw: *mut c_void,
+    pending: AtomicU32,
+    sq_mmap_count: AtomicU8,
+    sq_dropped: AtomicBool,
+    eventfd: RawFd,
 }
+
+impl Drop for IoUringMeta {
+    fn drop(&mut self) {
+        unsafe {
+            io_uring_register(self.fd as u32, sys::IORING_UNREGISTER_EVENTFD, std::ptr::null_mut(), 0);
+            libc::close(self.fd);
+            libc::close(self.eventfd);
+        }
+    }
+}
+
+impl IoUringMeta {
+    fn new(fd: RawFd, params: sys::io_uring_params) -> Self {
+        let is_single_mmap = params.features & sys::IORING_FEAT_SINGLE_MMAP != 0;
+
+        let mut eventfd = unsafe { libc::eventfd(0, 0) };
+        unsafe {
+            io_uring_register(fd as u32, sys::IORING_REGISTER_EVENTFD, &mut eventfd as *mut _ as *mut c_void, 1);
+        }
+
+        Self {
+            fd,
+            params,
+            pending: AtomicU32::new(0),
+            sq_mmap_count: AtomicU8::new(if is_single_mmap { 2 } else { 1 }),
+            sq_dropped: AtomicBool::new(false),
+            eventfd,
+        }
+    }
+
+    fn notify(&self) {
+        static BUF: [u8; 8] = u64::to_ne_bytes(1);
+        unsafe {
+            libc::write(self.eventfd, BUF.as_ptr() as *const _, BUF.len());
+        }
+    }
+}
+
+impl IoUringMeta {
+    fn map_sizes(&self) -> MemoryMapSize {
+        MemoryMapSize::calculate(&self.params)
+    }
+}
+
+pub struct IoUringSq(Arc<IoUringSqInner>);
+
+impl Debug for IoUringSq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringSq").finish_non_exhaustive()
+    }
+}
+
+impl From<IoUringSqInner> for IoUringSq {
+    fn from(val: IoUringSqInner) -> Self {
+        Self(Arc::new(val))
+    }
+}
+
+impl IoUringSq {
+    pub fn merge(self, cq: IoUringCq) -> IoUring {
+        IoUring {
+            meta: self.0.meta.clone(),
+            sq: self,
+            cq,
+        }
+    }
+}
+
+impl IoUringSq {
+    pub fn enqueue<Op: SubmissionOp>(&self, entry: Op) -> Result<CompletionReceiver<Op>, Error> {
+        let (sqe, rx) = entry.into_sqe();
+        unsafe { self.0.enqueue(sqe) }?;
+        Ok(rx)
+    }
+
+    pub fn submit_all(&self) -> Result<u32, Error> {
+        self.0.submit_all()
+    }
+}
+
+struct IoUringSqInner {
+    meta: Arc<IoUringMeta>,
+    sq_raw: *mut c_void,
+    sqe_raw: *mut c_void,
+    updating_tail: AtomicU32,
+}
+
+unsafe impl Send for IoUringSqInner {}
+unsafe impl Sync for IoUringSqInner {}
+
+impl Drop for IoUringSqInner {
+    fn drop(&mut self) {
+        let submit_result = self.submit_all();
+        if submit_result.is_err() {
+            // clean up remaining sqes
+            let head = self.head_ref();
+            let tail = self.tail_ref();
+            let mask = *self.mask_ref();
+            let last_head = head.load(Ordering::Acquire);
+            let last_tail = tail.swap(last_head, Ordering::Release);
+            self.meta.pending.fetch_sub(last_tail - last_head, Ordering::AcqRel);
+
+            let array = self.array_ref();
+            let sqe_raw = self.sqe_raw as *mut RawSqe;
+            for idx in last_head..last_tail {
+                unsafe {
+                    let idx = *array.offset((idx & mask) as isize);
+                    let sqe = sqe_raw.offset(idx as isize).read();
+                    let sender = Box::from_raw(sqe.user_data as *mut CompletionSender);
+                    drop(sender);
+                }
+            }
+        }
+        self.meta.sq_dropped.store(true, Ordering::Release);
+        self.meta.notify();
+
+        let sizes = self.meta.map_sizes();
+        unsafe {
+            if !self.sq_raw.is_null() {
+                let count = self.meta.sq_mmap_count.fetch_sub(1, Ordering::AcqRel);
+                if count == 1 {
+                    libc::munmap(self.sq_raw, sizes.sq);
+                }
+                self.sq_raw = std::ptr::null_mut();
+            }
+            if !self.sqe_raw.is_null() {
+                libc::munmap(self.sqe_raw, sizes.sqe);
+                self.sqe_raw = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+impl IoUringSqInner {
+    fn sq_bytes_ptr(&self) -> *mut u8 {
+        self.sq_raw as *mut u8
+    }
+
+    unsafe fn sq_offset_atomic(&self, offset: u32) -> &AtomicU32 {
+        &*(self.sq_bytes_ptr().offset(offset as isize) as *const AtomicU32)
+    }
+
+    fn head_ref(&self) -> &AtomicU32 {
+        unsafe { self.sq_offset_atomic(self.meta.params.sq_off.head) }
+    }
+
+    fn tail_ref(&self) -> &AtomicU32 {
+        unsafe { self.sq_offset_atomic(self.meta.params.sq_off.tail) }
+    }
+
+    fn mask_ref(&self) -> &u32 {
+        unsafe {
+            &*(self.sq_bytes_ptr().offset(self.meta.params.sq_off.ring_mask as isize) as *const u32)
+        }
+    }
+
+    fn array_ref(&self) -> *mut u32 {
+        unsafe {
+            self.sq_bytes_ptr().offset(self.meta.params.sq_off.array as isize) as *mut u32
+        }
+    }
+
+    /// # Safety
+    /// Unsynchronized access
+    unsafe fn write_to_idx(&self, index: u32, sqe: RawSqe) {
+        let mask = *self.mask_ref();
+        let array_ptr = self.array_ref() as *const UnsafeCell<u32>;
+        let sqe_ptr = self.sqe_raw as *const UnsafeCell<RawSqe>;
+
+        let array_idx = index & mask;
+        (*sqe_ptr.offset(array_idx as isize)).get().write(sqe);
+        (*array_ptr.offset(array_idx as isize)).get().write(array_idx);
+    }
+}
+
+impl IoUringSqInner {
+    /// 큐에 SQE 하나를 넣습니다.
+    ///
+    /// # Safety
+    /// `sqe`는 해당하는 CQE가 돌아올 때까지 올바른 값을 갖고 있어야 합니다.
+    unsafe fn enqueue(&self, entry: RawSqe) -> Result<(), Error> {
+        let head = self.head_ref();
+        let tail = self.tail_ref();
+        let updating_tail = &self.updating_tail;
+        let mask = *self.mask_ref();
+
+        let backoff = crossbeam_utils::Backoff::new();
+        let index = loop {
+            let index = updating_tail.load(Ordering::Acquire);
+            let head = head.load(Ordering::Acquire);
+            if head != index && (head & mask) == (index & mask) {
+                return Err(Error::SubmissionQueueFull);
+            }
+
+            let result = updating_tail.compare_exchange(index, index.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire);
+            if result.is_err() {
+                // 다른 스레드가 먼저 갱신했으므로 기다림
+                backoff.spin();
+            } else {
+                break index;
+            }
+        };
+        backoff.reset();
+
+        self.meta.pending.fetch_add(1, Ordering::Relaxed);
+        self.write_to_idx(index, entry);
+
+        while tail.compare_exchange(index, index.wrapping_add(1), Ordering::AcqRel, Ordering::Acquire).is_err() {
+            // 이전 스레드가 작업을 마칠 때까지 대기
+            backoff.snooze();
+        }
+
+        Ok(())
+    }
+
+    fn submit_all(&self) -> Result<u32, Error> {
+        let head = self.head_ref();
+        let tail = self.tail_ref();
+        let count = tail.load(Ordering::Acquire) - head.load(Ordering::Acquire);
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let ret = unsafe { io_uring_enter(self.meta.fd as u32, count, 0, 0) };
+        if ret < 0 {
+            let errno = unsafe { *libc::__errno_location() };
+            Err(Error::SubmissionFailed(errno))
+        } else {
+            Ok(ret as u32)
+        }
+    }
+}
+
+pub struct IoUringCq(IoUringCqInner);
+
+impl Debug for IoUringCq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IoUringCq").finish_non_exhaustive()
+    }
+}
+
+impl From<IoUringCqInner> for IoUringCq {
+    fn from(val: IoUringCqInner) -> Self {
+        Self(val)
+    }
+}
+
+impl IoUringCq {
+    pub fn wait(&self) {
+        let inner = &self.0;
+        let mut buf = [0u8; 8];
+
+        unsafe {
+            let flags = libc::fcntl(inner.meta.eventfd, libc::F_GETFL);
+            if flags & libc::O_NONBLOCK == 0 {
+                libc::fcntl(inner.meta.eventfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+        }
+
+        loop {
+            while let Some(cqe) = inner.dequeue() {
+                let sender = cqe.user_data as *mut CompletionSender;
+                unsafe {
+                    if (*sender).channel.send(cqe).is_err() {
+                        // 끊어졌으므로 여기서 할당 해제
+                        let sender = Box::from_raw(sender);
+                        drop(sender);
+                    }
+                }
+            }
+
+            let pending = inner.meta.pending.load(Ordering::Acquire);
+            if pending == 0 && inner.meta.sq_dropped.load(Ordering::Acquire) {
+                break;
+            }
+
+            unsafe {
+                let result = libc::read(inner.meta.eventfd, buf.as_mut_ptr() as *mut c_void, buf.len());
+                if result == -1 {
+                    let errno = *libc::__errno_location();
+                    if errno == libc::EBUSY || errno == libc::EWOULDBLOCK {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn run(&self) {
+        let inner = &self.0;
+        let mut buf = [0u8; 8];
+
+        unsafe {
+            let flags = libc::fcntl(inner.meta.eventfd, libc::F_GETFL);
+            if flags & libc::O_NONBLOCK != 0 {
+                libc::fcntl(inner.meta.eventfd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+            }
+        }
+
+        loop {
+            while let Some(cqe) = inner.dequeue() {
+                let sender = cqe.user_data as *mut CompletionSender;
+                unsafe {
+                    if (*sender).channel.send(cqe).is_err() {
+                        // 끊어졌으므로 여기서 할당 해제
+                        let sender = Box::from_raw(sender);
+                        drop(sender);
+                    }
+                }
+            }
+
+            let pending = inner.meta.pending.load(Ordering::Acquire);
+            if pending == 0 && inner.meta.sq_dropped.load(Ordering::Acquire) {
+                break;
+            }
+
+            unsafe {
+                libc::read(inner.meta.eventfd, buf.as_mut_ptr() as *mut c_void, buf.len());
+            }
+        }
+    }
+}
+
+impl IoUringCq {
+    pub fn merge(self, sq: IoUringSq) -> IoUring {
+        IoUring {
+            meta: self.0.meta.clone(),
+            sq,
+            cq: self,
+        }
+    }
+}
+
+struct IoUringCqInner {
+    meta: Arc<IoUringMeta>,
+    cq_raw: *mut c_void,
+}
+
+unsafe impl Send for IoUringCqInner {}
+
+impl Drop for IoUringCqInner {
+    fn drop(&mut self) {
+        let sizes = self.meta.map_sizes();
+        unsafe {
+            if !self.cq_raw.is_null() {
+                let count = self.meta.sq_mmap_count.fetch_sub(1, Ordering::AcqRel);
+                if count == 1 {
+                    libc::munmap(self.cq_raw, sizes.cq);
+                }
+                self.cq_raw = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+impl IoUringCqInner {
+    fn cq_bytes_ptr(&self) -> *mut u8 {
+        self.cq_raw as *mut u8
+    }
+
+    unsafe fn cq_offset_atomic(&self, offset: u32) -> &AtomicU32 {
+        &*(self.cq_bytes_ptr().offset(offset as isize) as *const AtomicU32)
+    }
+
+    fn head_ref(&self) -> &AtomicU32 {
+        unsafe { self.cq_offset_atomic(self.meta.params.cq_off.head) }
+    }
+
+    fn tail_ref(&self) -> &AtomicU32 {
+        unsafe { self.cq_offset_atomic(self.meta.params.cq_off.tail) }
+    }
+
+    fn mask_ref(&self) -> &u32 {
+        unsafe {
+            &*(self.cq_bytes_ptr().offset(self.meta.params.cq_off.ring_mask as isize) as *const u32)
+        }
+    }
+
+    /// # Safety
+    /// Unsynchronized access
+    unsafe fn read_from_idx(&self, index: u32) -> RawCqe {
+        let mask = *self.mask_ref();
+        let cqe_ptr = self.cq_bytes_ptr().offset(self.meta.params.cq_off.cqes as isize) as *const RawCqe;
+
+        let cqe_idx = index & mask;
+        cqe_ptr.offset(cqe_idx as isize).read()
+    }
+}
+
+impl IoUringCqInner {
+    fn dequeue(&self) -> Option<RawCqe> {
+        let head = self.head_ref();
+        let tail = self.tail_ref();
+
+        let index = head.load(Ordering::Acquire);
+        let tail = tail.load(Ordering::Acquire);
+        if index == tail {
+            return None;
+        }
+        head.fetch_add(1, Ordering::Release);
+
+        let cqe = unsafe { self.read_from_idx(index) };
+        self.meta.pending.fetch_sub(1, Ordering::Relaxed);
+        Some(cqe)
+    }
+}
+
+// No unsynchronized access of raw pointers
+unsafe impl Send for IoUring {}
 
 #[derive(Debug)]
 pub enum Error {
@@ -85,7 +530,7 @@ pub enum Error {
 impl IoUring {
     /// `entries` 개의 SQE를 가질 수 있는 io_uring 구조체를 만듭니다.
     pub fn new(entries: u32) -> Result<Self, Error> {
-        let mut uring = unsafe {
+        let meta = unsafe {
             // 커널에 링 버퍼를 부탁한다. 커널은 버퍼를 만든 뒤 관련 파라미터를 돌려준다.
             let mut params =
                 std::mem::MaybeUninit::<sys::io_uring_params>::zeroed().assume_init();
@@ -95,26 +540,25 @@ impl IoUring {
                 return Err(Error::Other(errno));
             }
 
-            // 먼저 IoUring 값을 만들어 두면 중간에 실패하더라도 IoUring이 drop되면서 남은 자원을
-            // 회수하도록 할 수 있다.
-            Self {
-                fd,
-                params,
-                sq_raw: std::ptr::null_mut(),
-                cq_raw: std::ptr::null_mut(),
-                sqe_raw: std::ptr::null_mut(),
-            }
+            IoUringMeta::new(fd, params)
         };
-        let fd = uring.fd;
-        let params = &uring.params;
+        let meta = Arc::new(meta);
+        let fd = meta.fd;
+        let params = &meta.params;
 
         // Linux >=5.4에서는 mmap 한 번에 SQ와 CQ가 모두 매핑되어, 쓸 때는 SQ에 쓰고 읽을 때는 CQ를
         // 읽게 된다. features 필드의 IORING_FEAT_SINGLE_MMAP 비트를 확인해 만약 그렇다면 두 개의
         // 큐 중에 큰 쪽으로 한 번만 mmap한다.
         let is_single_mmap = params.features & sys::IORING_FEAT_SINGLE_MMAP != 0;
-        let sizes = MemoryMapSize::calculate(params);
+        let sizes = meta.map_sizes();
 
-        uring.sq_raw = unsafe {
+        let mut sq = IoUringSqInner {
+            meta: meta.clone(),
+            sq_raw: std::ptr::null_mut(),
+            sqe_raw: std::ptr::null_mut(),
+            updating_tail: AtomicU32::new(0),
+        };
+        sq.sq_raw = unsafe {
             let sq_raw = libc::mmap(
                 std::ptr::null_mut(),
                 sizes.sq,
@@ -129,10 +573,15 @@ impl IoUring {
             }
             sq_raw
         };
+        sq.updating_tail.store(sq.tail_ref().load(Ordering::Acquire), Ordering::Release);
 
-        uring.cq_raw = if is_single_mmap {
+        let mut cq = IoUringCqInner {
+            meta: meta.clone(),
+            cq_raw: std::ptr::null_mut(),
+        };
+        cq.cq_raw = if is_single_mmap {
             // SQ와 CQ가 같은 주소를 공유
-            uring.sq_raw
+            sq.sq_raw
         } else {
             // CQ를 따로 매핑해야 함
             unsafe {
@@ -153,7 +602,7 @@ impl IoUring {
         };
 
         // 실제 SQE가 들어갈 버퍼를 매핑한다.
-        uring.sqe_raw = unsafe {
+        sq.sqe_raw = unsafe {
             let sqe_raw = libc::mmap(
                 std::ptr::null_mut(),
                 sizes.sqe,
@@ -169,232 +618,14 @@ impl IoUring {
             sqe_raw
         };
 
-        Ok(uring)
+        Ok(Self {
+            meta,
+            sq: sq.into(),
+            cq: cq.into(),
+        })
     }
 
-    /// io_uring 구조체의 정보를 참고해 SQ와 CQ에 접근할 수 있도록 합니다.
-    pub fn queue(&mut self) -> (RawSubmissionQueue, RawCompletionQueue) {
-        let sq_ptr = self.sq_raw as *mut u8;
-        let cq_ptr = self.cq_raw as *mut u8;
-        let sqes = unsafe {
-            std::slice::from_raw_parts_mut(self.sqe_raw as *mut _, self.params.sq_entries as usize)
-        };
-
-        let sq = unsafe {
-            RawSubmissionQueue {
-                fd: self.fd,
-                head: &*(sq_ptr.add(self.params.sq_off.head as usize) as *const _),
-                tail: &*(sq_ptr.add(self.params.sq_off.tail as usize) as *const _),
-                mask: &*(sq_ptr.add(self.params.sq_off.ring_mask as usize) as *const _),
-                flags: &*(sq_ptr.add(self.params.sq_off.flags as usize) as *const _),
-                dropped_count: &*(sq_ptr.add(self.params.sq_off.dropped as usize) as *const _),
-                indices: std::slice::from_raw_parts_mut(
-                    sq_ptr.add(self.params.sq_off.array as usize) as *mut _,
-                    self.params.sq_entries as usize,
-                ),
-                sqes,
-            }
-        };
-
-        let cq = unsafe {
-            RawCompletionQueue {
-                fd: self.fd,
-                head: &*(cq_ptr.add(self.params.cq_off.head as usize) as *const _),
-                tail: &*(cq_ptr.add(self.params.cq_off.tail as usize) as *const _),
-                mask: &*(cq_ptr.add(self.params.cq_off.ring_mask as usize) as *const _),
-                flags: &*(cq_ptr.add(self.params.cq_off.flags as usize) as *const _),
-                overflow_count: &*(cq_ptr.add(self.params.cq_off.overflow as usize) as *const _),
-                cqes: std::slice::from_raw_parts_mut(
-                    cq_ptr.add(self.params.cq_off.cqes as usize) as *mut _,
-                    self.params.cq_entries as usize,
-                ),
-            }
-        };
-
-        (sq, cq)
-    }
-}
-
-impl AsRawFd for IoUring {
-    fn as_raw_fd(&self) -> RawFd {
-        self.fd
-    }
-}
-
-impl Drop for IoUring {
-    fn drop(&mut self) {
-        // 여기서 사용한 리소스, 또는 만들다 만 리소스의 정리가 일어난다.
-        // fd와 params는 항상 초기화되어 있다고 가정한다.
-        let is_single_mmap = self.params.features & sys::IORING_FEAT_SINGLE_MMAP != 0;
-        let sizes = MemoryMapSize::calculate(&self.params);
-        unsafe {
-            if !self.sq_raw.is_null() {
-                libc::munmap(self.sq_raw, sizes.sq);
-                self.sq_raw = std::ptr::null_mut();
-            }
-            if !is_single_mmap && !self.cq_raw.is_null() {
-                libc::munmap(self.cq_raw, sizes.cq);
-                self.cq_raw = std::ptr::null_mut();
-            }
-            if !self.sqe_raw.is_null() {
-                libc::munmap(self.sqe_raw, sizes.sqe);
-                self.sqe_raw = std::ptr::null_mut();
-            }
-            libc::close(self.fd);
-        }
-    }
-}
-
-pub struct RawSubmissionQueue<'q> {
-    fd: RawFd,
-    head: &'q atomic::AtomicU32,
-    tail: &'q atomic::AtomicU32,
-    mask: &'q u32,
-    flags: &'q atomic::AtomicU32,
-    dropped_count: &'q atomic::AtomicU32,
-    indices: &'q mut [u32],
-    sqes: &'q mut [RawSqe],
-}
-
-impl Debug for RawSubmissionQueue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawSubmissionQueue")
-            .field("fd", &self.fd)
-            .field(
-                "sqes",
-                &format_args!(
-                    "({}/{} {})",
-                    self.len(),
-                    self.entry_count(),
-                    if self.len() == 1 { "entry" } else { "entries" }
-                ),
-            )
-            .finish()
-    }
-}
-
-impl RawSubmissionQueue<'_> {
-    fn entry_count(&self) -> u32 {
-        self.sqes.len() as u32
-    }
-
-    /// 큐에 남아 있는 SQE의 개수를 가져옵니다.
-    pub fn len(&self) -> u32 {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Relaxed);
-        tail - head
-    }
-
-    /// 큐에 비어 있는 자리의 개수를 가져옵니다.
-    pub fn empty_entries(&self) -> u32 {
-        self.entry_count() - self.len()
-    }
-
-    /// 큐에 SQE 하나를 넣습니다.
-    ///
-    /// # Safety
-    /// `sqe`는 해당하는 CQE가 돌아올 때까지 올바른 값을 갖고 있어야 합니다.
-    pub unsafe fn enqueue(&mut self, sqe: RawSqe) -> Result<(), Error> {
-        let head = self.head.load(Ordering::Acquire);
-        let tail = self.tail.load(Ordering::Relaxed);
-        let mask = *self.mask;
-        let index = tail & mask;
-        // 링 버퍼가 가득 찼는지 확인한다.
-        if head != tail && (head & mask) == index {
-            return Err(Error::SubmissionQueueFull);
-        }
-
-        // 버퍼 끝에 SQE를 넣는다.
-        self.sqes[index as usize] = sqe;
-        self.indices[index as usize] = index;
-        self.tail.store(tail + 1, Ordering::Release);
-
-        Ok(())
-    }
-
-    /// 큐의 SQE를 처리하도록 커널에 요청합니다.
-    fn submit_inner(&self, to_submit: u32, min_complete: u32, flags: u32) -> Result<u32, Error> {
-        let submit_count =
-            unsafe { io_uring_enter(self.fd as u32, to_submit, min_complete, flags) };
-        if submit_count < 0 {
-            let errno = unsafe { *libc::__errno_location() };
-            return Err(Error::SubmissionFailed(errno));
-        }
-        Ok(submit_count as u32)
-    }
-
-    /// 큐의 SQE를 처리하도록 커널에 요청합니다. 이 함수는 커널에 요청한 후 바로 리턴합니다.
-    pub fn submit(&self, to_submit: u32) -> Result<u32, Error> {
-        self.submit_inner(to_submit, 0, 0)
-    }
-
-    /// 큐의 SQE를 처리하도록 커널에 요청합니다. 이 함수는 커널에 요청한 후 `min_complete`개의
-    /// CQE가 돌아올 때까지 리턴하지 않습니다.
-    pub fn submit_and_wait(&self, to_submit: u32, min_complete: u32) -> Result<u32, Error> {
-        self.submit_inner(to_submit, min_complete, sys::IORING_ENTER_GETEVENTS)
-    }
-}
-
-pub struct RawCompletionQueue<'q> {
-    fd: RawFd,
-    head: &'q atomic::AtomicU32,
-    tail: &'q atomic::AtomicU32,
-    mask: &'q u32,
-    overflow_count: &'q atomic::AtomicU32,
-    flags: &'q atomic::AtomicU32,
-    cqes: &'q mut [RawCqe],
-}
-
-impl Debug for RawCompletionQueue<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawCompletionQueue")
-            .field("fd", &self.fd)
-            .field(
-                "cqes",
-                &format_args!(
-                    "({}/{} {})",
-                    self.len(),
-                    self.entry_count(),
-                    if self.len() == 1 { "entry" } else { "entries" }
-                ),
-            )
-            .finish()
-    }
-}
-
-impl RawCompletionQueue<'_> {
-    fn entry_count(&self) -> u32 {
-        self.cqes.len() as u32
-    }
-
-    /// 큐에 남아 있는 CQE의 개수를 가져옵니다.
-    pub fn len(&self) -> u32 {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        tail - head
-    }
-
-    /// 큐에 남아 있는 SQE의 개수를 가져옵니다.
-    pub fn empty_entries(&self) -> u32 {
-        self.entry_count() - self.len()
-    }
-
-    /// 큐에서 CQE 하나를 꺼냅니다.
-    pub fn dequeue(&mut self) -> Option<RawCqe> {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        // 링 버퍼가 비어 있는지 확인한다.
-        if head == tail {
-            return None;
-        }
-
-        let mask = *self.mask;
-        let index = head & mask;
-
-        // 링 버퍼 앞에서 CQE 하나를 꺼낸다.
-        let cqe = self.cqes[index as usize];
-        self.head.store(head + 1, Ordering::Release);
-
-        Some(cqe)
+    pub fn split(self) -> (IoUringSq, IoUringCq) {
+        (self.sq, self.cq)
     }
 }

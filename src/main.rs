@@ -1,48 +1,43 @@
-use std::os::unix::prelude::*;
-
-mod io_uring;
-use io_uring::{
-    sys as io_uring_sys,
-    IoUring,
-};
+pub mod io_uring;
+use io_uring::IoUring;
 
 fn main() {
-    let mut uring = IoUring::new(2).expect("Failed to request ring buffer");
-    let (mut sq, mut cq) = uring.queue();
+    let uring = IoUring::new(2).expect("Failed to request ring buffer");
+    let (sq, cq) = uring.split();
 
     let file = std::fs::File::open("test").unwrap();
+    let buf1 = vec![0u8; 4096];
+    let buf2 = vec![0u8; 4096];
 
-    // preadv 명령을 담은 SQE를 초기화한다.
-    let mut sqe =
-        unsafe { std::mem::MaybeUninit::<io_uring::RawSqe>::zeroed().assume_init() };
-    let mut buf = vec![0u8; 4096];
-    let iovecs = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut _,
-        iov_len: buf.len(),
-    };
-    sqe.opcode = io_uring_sys::IORING_OP_READV as u8; // preadv
-    sqe.fd = file.as_raw_fd(); // fd
-    sqe.__bindgen_anon_1.off = 0; // offset
-    sqe.__bindgen_anon_2.addr = &iovecs as *const _ as usize as u64; // iov
-    sqe.len = 1; // iovcnt
+    /*
+    let thread_handle = std::thread::spawn(move || {
+        cq.run()
+    });
+    */
 
-    // SQE를 넣고 처리가 끝날 때까지 기다린 뒤 CQE를 꺼낸다.
-    unsafe { sq.enqueue(sqe).unwrap() };
-    let submitted_count = sq.submit_and_wait(1, 1).unwrap();
+    let handle1 = sq.enqueue(io_uring::VectoredRead::with_single_buffer(file.try_clone().unwrap(), 0, buf1)).unwrap();
+    let handle2 = sq.enqueue(io_uring::VectoredRead::with_single_buffer(file, 3, buf2)).unwrap();
+    let submitted_count = sq.submit_all().unwrap();
     eprintln!("Submitted {} request(s)", submitted_count);
-    let cqe = cq.dequeue().unwrap();
-    dbg!(&cqe);
+    // drop(sq);
+    cq.wait();
 
-    // preadv의 결과를 확인한다.
-    let read_cnt = cqe.res;
-    if read_cnt < 0 {
-        let errno = -read_cnt;
-        eprintln!("Read failed (errno {})", errno);
-        std::process::exit(1);
-    }
-
-    let read_cnt = read_cnt as usize;
+    let mut result = handle1.recv();
+    let read_cnt = result.result.unwrap();
+    let buf = result.iovec.pop().unwrap();
     let data = &buf[..read_cnt];
     eprintln!("Read {} byte(s)", read_cnt);
     dbg!(data);
+
+    let mut result = handle2.recv();
+    let read_cnt = result.result.unwrap();
+    let buf = result.iovec.pop().unwrap();
+    let data = &buf[..read_cnt];
+    eprintln!("Read {} byte(s)", read_cnt);
+    dbg!(data);
+
+    /*
+    eprintln!("Joining...");
+    thread_handle.join().unwrap();
+    */
 }
