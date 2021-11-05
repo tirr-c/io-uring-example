@@ -5,6 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use libc::{c_int, c_uint, c_void};
+use nix::{
+    errno,
+    fcntl,
+    sys::{eventfd, mman},
+    unistd,
+};
 
 pub mod sys;
 pub use sys::io_uring_cqe as RawCqe;
@@ -114,9 +120,9 @@ impl Drop for IoUringMeta {
     fn drop(&mut self) {
         unsafe {
             io_uring_register(self.fd as u32, sys::IORING_UNREGISTER_EVENTFD, std::ptr::null_mut(), 0);
-            libc::close(self.fd);
-            libc::close(self.eventfd);
         }
+        unistd::close(self.fd).ok();
+        unistd::close(self.eventfd).ok();
     }
 }
 
@@ -124,7 +130,8 @@ impl IoUringMeta {
     fn new(fd: RawFd, params: sys::io_uring_params) -> Self {
         let is_single_mmap = params.features & sys::IORING_FEAT_SINGLE_MMAP != 0;
 
-        let mut eventfd = unsafe { libc::eventfd(0, 0) };
+        let mut eventfd = eventfd::eventfd(0, eventfd::EfdFlags::empty())
+            .expect("eventfd creation failed");
         unsafe {
             io_uring_register(fd as u32, sys::IORING_REGISTER_EVENTFD, &mut eventfd as *mut _ as *mut c_void, 1);
         }
@@ -141,9 +148,7 @@ impl IoUringMeta {
 
     fn notify(&self) {
         static BUF: [u8; 8] = u64::to_ne_bytes(1);
-        unsafe {
-            libc::write(self.eventfd, BUF.as_ptr() as *const _, BUF.len());
-        }
+        unistd::write(self.eventfd, &BUF).ok();
     }
 }
 
@@ -230,12 +235,12 @@ impl Drop for IoUringSqInner {
             if !self.sq_raw.is_null() {
                 let count = self.meta.sq_mmap_count.fetch_sub(1, Ordering::AcqRel);
                 if count == 1 {
-                    libc::munmap(self.sq_raw, sizes.sq);
+                    mman::munmap(self.sq_raw, sizes.sq).ok();
                 }
                 self.sq_raw = std::ptr::null_mut();
             }
             if !self.sqe_raw.is_null() {
-                libc::munmap(self.sqe_raw, sizes.sqe);
+                mman::munmap(self.sqe_raw, sizes.sqe).ok();
                 self.sqe_raw = std::ptr::null_mut();
             }
         }
@@ -334,7 +339,7 @@ impl IoUringSqInner {
 
         let ret = unsafe { io_uring_enter(self.meta.fd as u32, count, 0, 0) };
         if ret < 0 {
-            let errno = unsafe { *libc::__errno_location() };
+            let errno = errno::errno();
             Err(Error::SubmissionFailed(errno))
         } else {
             Ok(ret as u32)
@@ -361,11 +366,13 @@ impl IoUringCq {
         let inner = &self.0;
         let mut buf = [0u8; 8];
 
-        unsafe {
-            let flags = libc::fcntl(inner.meta.eventfd, libc::F_GETFL);
-            if flags & libc::O_NONBLOCK == 0 {
-                libc::fcntl(inner.meta.eventfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+        // make eventfd non-blocking
+        let flags = fcntl::fcntl(inner.meta.eventfd, fcntl::FcntlArg::F_GETFL)
+            .expect("cannot fcntl GETFL on eventfd");
+        let mut flags = fcntl::OFlag::from_bits(flags).unwrap();
+        if !flags.contains(fcntl::OFlag::O_NONBLOCK) {
+            flags.set(fcntl::OFlag::O_NONBLOCK, true);
+            fcntl::fcntl(inner.meta.eventfd, fcntl::FcntlArg::F_SETFL(flags)).ok();
         }
 
         loop {
@@ -385,14 +392,9 @@ impl IoUringCq {
                 break;
             }
 
-            unsafe {
-                let result = libc::read(inner.meta.eventfd, buf.as_mut_ptr() as *mut c_void, buf.len());
-                if result == -1 {
-                    let errno = *libc::__errno_location();
-                    if errno == libc::EBUSY || errno == libc::EWOULDBLOCK {
-                        break;
-                    }
-                }
+            let result = unistd::read(inner.meta.eventfd, &mut buf);
+            if let Err(errno::Errno::EBUSY | errno::Errno::EWOULDBLOCK) = result {
+                break;
             }
         }
     }
@@ -401,11 +403,13 @@ impl IoUringCq {
         let inner = &self.0;
         let mut buf = [0u8; 8];
 
-        unsafe {
-            let flags = libc::fcntl(inner.meta.eventfd, libc::F_GETFL);
-            if flags & libc::O_NONBLOCK != 0 {
-                libc::fcntl(inner.meta.eventfd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
-            }
+        // make eventfd blocking
+        let flags = fcntl::fcntl(inner.meta.eventfd, fcntl::FcntlArg::F_GETFL)
+            .expect("cannot fcntl GETFL on eventfd");
+        let mut flags = fcntl::OFlag::from_bits(flags).unwrap();
+        if flags.contains(fcntl::OFlag::O_NONBLOCK) {
+            flags.set(fcntl::OFlag::O_NONBLOCK, false);
+            fcntl::fcntl(inner.meta.eventfd, fcntl::FcntlArg::F_SETFL(flags)).ok();
         }
 
         loop {
@@ -425,9 +429,7 @@ impl IoUringCq {
                 break;
             }
 
-            unsafe {
-                libc::read(inner.meta.eventfd, buf.as_mut_ptr() as *mut c_void, buf.len());
-            }
+            unistd::read(inner.meta.eventfd, &mut buf).ok();
         }
     }
 }
@@ -453,10 +455,11 @@ impl Drop for IoUringCqInner {
     fn drop(&mut self) {
         let sizes = self.meta.map_sizes();
         unsafe {
+            // FIXME
             if !self.cq_raw.is_null() {
                 let count = self.meta.sq_mmap_count.fetch_sub(1, Ordering::AcqRel);
                 if count == 1 {
-                    libc::munmap(self.cq_raw, sizes.cq);
+                    mman::munmap(self.cq_raw, sizes.cq).ok();
                 }
                 self.cq_raw = std::ptr::null_mut();
             }
@@ -536,7 +539,7 @@ impl IoUring {
                 std::mem::MaybeUninit::<sys::io_uring_params>::zeroed().assume_init();
             let fd = io_uring_setup(entries, &mut params);
             if fd == -1 {
-                let errno = *libc::__errno_location();
+                let errno = errno::errno();
                 return Err(Error::Other(errno));
             }
 
@@ -559,19 +562,18 @@ impl IoUring {
             updating_tail: AtomicU32::new(0),
         };
         sq.sq_raw = unsafe {
-            let sq_raw = libc::mmap(
+            let map_result = mman::mmap(
                 std::ptr::null_mut(),
                 sizes.sq,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
+                mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+                mman::MapFlags::MAP_SHARED | mman::MapFlags::MAP_POPULATE,
                 fd,
                 sys::IORING_OFF_SQ_RING as i64,
             );
-            if sq_raw == libc::MAP_FAILED {
-                let errno = *libc::__errno_location();
-                return Err(Error::MapFailed(errno));
+            match map_result {
+                Ok(sq_raw) => sq_raw,
+                Err(errno) => return Err(Error::MapFailed(errno as i32)),
             }
-            sq_raw
         };
         sq.updating_tail.store(sq.tail_ref().load(Ordering::Acquire), Ordering::Release);
 
@@ -585,37 +587,35 @@ impl IoUring {
         } else {
             // CQ를 따로 매핑해야 함
             unsafe {
-                let cq_raw = libc::mmap(
+                let map_result = mman::mmap(
                     std::ptr::null_mut(),
                     sizes.cq,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED | libc::MAP_POPULATE,
+                    mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+                    mman::MapFlags::MAP_SHARED | mman::MapFlags::MAP_POPULATE,
                     fd,
                     sys::IORING_OFF_CQ_RING as i64,
                 );
-                if cq_raw == libc::MAP_FAILED {
-                    let errno = *libc::__errno_location();
-                    return Err(Error::MapFailed(errno));
+                match map_result {
+                    Ok(cq_raw) => cq_raw,
+                    Err(errno) => return Err(Error::MapFailed(errno as i32)),
                 }
-                cq_raw
             }
         };
 
         // 실제 SQE가 들어갈 버퍼를 매핑한다.
         sq.sqe_raw = unsafe {
-            let sqe_raw = libc::mmap(
+            let map_result = mman::mmap(
                 std::ptr::null_mut(),
                 sizes.sqe,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
+                mman::ProtFlags::PROT_READ | mman::ProtFlags::PROT_WRITE,
+                mman::MapFlags::MAP_SHARED | mman::MapFlags::MAP_POPULATE,
                 fd,
                 sys::IORING_OFF_SQES as i64,
             );
-            if sqe_raw == libc::MAP_FAILED {
-                let errno = *libc::__errno_location();
-                return Err(Error::MapFailed(errno));
+            match map_result {
+                Ok(sqe_raw) => sqe_raw,
+                Err(errno) => return Err(Error::MapFailed(errno as i32)),
             }
-            sqe_raw
         };
 
         Ok(Self {

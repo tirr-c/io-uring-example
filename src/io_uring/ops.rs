@@ -6,7 +6,7 @@ use super::sys::{
     io_uring_sqe as RawSqe,
 };
 
-pub trait SubmissionOp: Sized {
+pub unsafe trait SubmissionOp: Sized {
     type Context: Send + 'static;
     type Result: Send;
 
@@ -89,7 +89,7 @@ pub struct VectoredReadResult<Fd> {
     pub result: Result<usize, std::io::Error>,
 }
 
-impl<Fd: AsRawFd + Send + 'static> SubmissionOp for VectoredRead<Fd> {
+unsafe impl<Fd: AsRawFd + Send + 'static> SubmissionOp for VectoredRead<Fd> {
     type Context = VectoredReadCtx<Fd>;
     type Result = VectoredReadResult<Fd>;
 
